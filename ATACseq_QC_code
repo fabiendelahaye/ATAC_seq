@@ -1,0 +1,653 @@
+#I need to combine fastq files for 10K gel
+
+cat 2*-10K-gel_S*_L001_R1_001.fastq.gz > 2-combined-10K-gel_S2_L001_R1_001.fastq.gz
+
+#######################
+##trimming of adapter##
+#######################
+
+#trim reads
+
+#trim_nextera_mm10.sh
+
+#!/bin/bash
+
+FILEBASENAMES=`ls *.fastq.gz`
+
+for f in ${FILEBASENAMES[@]} ;
+do
+	file=`echo $f|cut -d '_' -f 1`;
+	qsub trim_nextera_mm10 $file Laurent SINGLE CTGTCTCTTATACACATCT;
+done
+
+#!/bin/bash     
+
+#need 5 paramters prefixFilename, sample_name_for_read_group, readtype, USER_SPECIFIED_SEQUENCE_TO_TRIM, and GENOME_SELECTED
+#readtype must be  SINGLE or PAIRED
+#USER_SPECIFIED_SEQUENCE_TO_TRIM must be CTGTCTCTTATACACATCT
+
+
+#$ -cwd 
+#$ -q all.q@@penguin
+#$ -N trim_nextera
+#$ -j y 
+#$ -S /bin/bash 
+#$ -l h_vmem=32G
+#$ -pe smp 4
+#$ -b n
+
+SCRIPT_NAME=trim_nextera_mm10
+
+thisDir=`pwd`
+echo thisDir = $thisDir
+
+prefixFilename=$1
+sample_name_for_read_group=$2
+library_name_for_read_group="${sample_name_for_read_group}-LIB"
+READTYPE=$3
+USER_SPECIFIED_SEQUENCE_TO_TRIM=$4
+
+
+echo            
+echo scriptname = ${SCRIPT_NAME}
+echo prefixFilename = $prefixFilename
+echo sample_name_for_read_group = $sample_name_for_read_group
+echo library_name_for_read_group = $library_name_for_read_group
+echo READTYPE = $READTYPE
+echo USER_SPECIFIED_SEQUENCE_TO_TRIM = $USER_SPECIFIED_SEQUENCE_TO_TRIM
+
+
+#this need to be updated
+UNTRIMMED_FASTQ_FILE_READ1=${prefixFilename}_S1_L001_R1_001.fastq.gz
+UNTRIMMED_FASTQ_FILE_READ2=${prefixFilename}_2.fastq.gz
+
+
+fqListForTrimGalore=""     #the untrimmed fastq file or files
+fqListForBWA=""            #the trimmed fq file or files that are the produce of trim_galore
+
+##  TRIMMED_FASTQ_FILE_READ1 will be used for input to fastq-screen and fqListForTrimGalore is for trim_galore call fqListForBWA will be used for bwa alignment call
+if [[ "$READTYPE" == "SINGLE" ]] ; then
+        TRIMMED_FASTQ_FILE_READ1=${prefixFilename}_trimmed.fq.gz
+        fqListForTrimGalore="${UNTRIMMED_FASTQ_FILE_READ1}"
+        fqListForBWA="${TRIMMED_FASTQ_FILE_READ1}"
+elif [[ "$READTYPE" == "PAIRED" ]] ; then
+        TRIMMED_FASTQ_FILE_READ1=${prefixFilename}.1_val_1.fq.gz
+        TRIMMED_FASTQ_FILE_READ2=${prefixFilename}.2_val_2.fq.gz
+        fqListForTrimGalore="--paired ${UNTRIMMED_FASTQ_FILE_READ1} ${UNTRIMMED_FASTQ_FILE_READ2}"  #################note had to added --paired here to complete the call and get validation for paired end 
+        fqListForBWA="${TRIMMED_FASTQ_FILE_READ1} ${TRIMMED_FASTQ_FILE_READ2}"
+fi
+                
+echo
+echo untrimmed fastq read1 =  ${UNTRIMMED_FASTQ_FILE_READ1}
+echo untrimmed fastq read2 =  ${UNTRIMMED_FASTQ_FILE_READ2}
+echo trimmed fastq read1 which does not yet exist will be named  ${TRIMMED_FASTQ_FILE_READ1}
+echo trimmed fastq read2 which does not yet exist and if needed will be named  ${TRIMMED_FASTQ_FILE_READ2}
+echo fqListForTrimGalore = $fqListForTrimGalore
+echo fqListForBWA = $fqListForBWA
+echo 
+
+module purge
+module load trim_galore/0.3.7/gcc.4.4.7
+echo
+module load FastQC/0.11.4/java.1.8.0_20
+module list
+echo
+echo starting trim_galore which will also do fastqc using these $fqListForTrimGalore
+echo
+
+trim_galore --adapter ${USER_SPECIFIED_SEQUENCE_TO_TRIM} --fastqc ${fqListForTrimGalore}
+
+
+#trim_galore --adapter CTGTCTCTTATACACATCT --fastqc 1-50K_S1_L001_R1_001.fastq.gz 
+#trim_galore --adapter CTGTCTCTTATACACATCT --fastqc 3-10K-nogel_S5_L001_R1_001.fastq.gz 
+#trim_galore --adapter CTGTCTCTTATACACATCT --fastqc 2-combined-10K-gel_S2_L001_R1_001.fastq.gz
+
+echo
+echo trim galore completed 
+echo
+
+module purge
+sleep 1
+module load fastq_screen/0.4.4/java.1.7.0_67
+module list
+
+echo starting fastq screen using ${TRIMMED_FASTQ_FILE_READ1} 
+echo
+ 
+fastq_screen ${TRIMMED_FASTQ_FILE_READ1} --aligner bowtie2 --subset 500000
+
+echo fastq screen completed
+
+
+################################
+### performing the alignment####
+################################
+
+module load picard-tools/1.92/java.1.8.0_20 
+
+mkdir Bams
+mkdir Sams
+mkdir Flagstats
+mkdir Picard_metrics
+
+for f1 in *_trimmed.fq.gz;
+do 
+ReadNum="$(echo ${f1} | cut -d '_' -f1 | cut -d '.' -f2)" # I had single end read but ATACseq should be performed using pairedend 
+echo $ReadNum
+SampleName="$(echo ${f1} | cut -d '_' -f1 )"#here need to be updated to capture info for each read,  I worked with single end
+echo $SampleName
+#if [ $ReadNum != '2' ]
+#then
+#Read1="$(echo ${f1})"
+#echo $Read1	
+#else
+#echo ${f1}
+
+#check for correct genome
+INDEXED_GENOME="/home/svc_wasp/wasp/metadata/Mmu/mm10/mm10/bwa_02_22_2018/mm10" 
+
+qsub -S /bin/bash -N ${SampleName}_align -j y -cwd -pe smp 8 -l h_vmem=5.6G << EOF
+
+module load bwa/0.7.13/gcc.4.4.7
+bwa mem -M -t 20 ${INDEXED_GENOME} ${f1} > Sams/${SampleName}.sam
+
+module load samtools/0.1.19/gcc.4.4.7
+module load picard-tools/1.92/java.1.8.0_20 
+
+## Select only uniquely mapped reads and sort
+
+samtools view -h -S -bq 1 -F 4 Sams/${SampleName}.sam | samtools sort -@ 2 - Bams/${SampleName}_UMap
+echo "${f1%.sam}_UMap.bam" >> Flagstats/${SampleName}_flagstat.txt
+samtools flagstat Bams/${SampleName}_UMap.bam >> Flagstats/${SampleName}_flagstat.txt
+samtools index Bams/${SampleName}_UMap.bam
+
+## Remove Mitochondrial reads 
+
+# Get reads that are not mitochondrial chr
+
+samtools view Bams/${SampleName}_UMap.bam | awk '\$3~"chrM"{print \$1}' | uniq > ${SampleName}.read.list
+java -jar $(which FilterSamReads.jar) I=Bams/${SampleName}_UMap.bam O=Bams/${SampleName}_UMap_noMT.bam READ_LIST_FILE=${SampleName}.read.list FILTER=excludeReadList
+samtools index Bams/${f1%.sam}_UMap_rmChrM.bam
+echo "${SampleName}_UMap_noMT.bam" >> Flagstats/${SampleName}_flagstat.txt
+samtools flagstat Bams/${SampleName}_UMap_noMT.bam >> Flagstats/${SampleName}_flagstat.txt
+	
+## Remove duplicates
+
+java -jar $(which MarkDuplicates.jar) INPUT=Bams/${SampleName}_UMap_noMT.bam OUTPUT=Bams/${SampleName}_UMap_noMT_mkdup.bam METRICS_FILE=Picard_metrics/${SampleName}_UMap_noMT_mkdup_metrics.txt REMOVE_DUPLICATES=true VALIDATION_STRINGENCY=SILENT CREATE_INDEX=false PROGRAM_RECORD_ID=MarkDuplicates PROGRAM_GROUP_NAME=MarkDuplicates ASSUME_SORTED=true MAX_SEQUENCES_FOR_DISK_READ_ENDS_MAP=50000
+echo "${SampleName}_UMap_noMT_mkdup.bam" >> Flagstats/${SampleName}_flagstat.txt
+samtools flagstat Bams/${SampleName}_UMap_noMT_mkdup.bam >> Flagstats/${SampleName}_flagstat.txt
+samtools index Bams/${SampleName}_UMap_noMT_mkdup.bam
+EOF
+#fi
+done
+
+# perform extra samtools rmdup
+for f1 in *_UMap_noMT_mkdup.bam;
+do
+echo $f1
+SampleName="$(echo ${f1} | cut -d '_' -f1)"#here need to be updated to capture info for each read,  I worked with single end
+echo $SampleName
+qsub -S /bin/bash -N ${SampleName}_rmdup -cwd -l h_vmem=20G -j y <<EOF
+
+module load samtools/0.1.19/gcc.4.4.7
+
+samtools rmdup -S ${f1} ${f1%.bam}_rmdup.bam
+echo "${SampleName}_UMap_noMT_mkdup_rmdup.bam" >> /gs/gsfs0/users/svc_wasp/ATACseq_Fabien/Flagstats/${SampleName}_flagstat.txt
+
+samtools flagstat ${f1%.bam}_rmdup.bam >> /gs/gsfs0/users/svc_wasp/ATACseq_Fabien/Flagstats/${SampleName}_flagstat.txt
+
+EOF
+done
+
+
+#generating the length_count file for QC 
+
+#this file will be used to plot length vs count and verify the histone profile of the ATAC seq library 
+
+samtools view sorted.bam | awk '$9>0' | cut -f 9 | sort | uniq -c | sort -b -k2,2n | sed -e 's/^[ \t]*//' > fragment_length_count.txt
+
+# Shift the reads for peak calling
+mkdir Beds
+for s in *_UMap_noMT_mkdup_rmdup.bam;
+do
+SampleName="$(echo ${s} | cut -d '_' -f1)" #here need to be updated to capture info for each read,  I worked with single end
+qsub -S /bin/bash -N Shift_${SampleName} -cwd -l h_vmem=20G -j y << EOF
+
+module load MACS2/2.1.0/python.2.7.8
+module load bedtools2
+module load samtools/0.1.19/gcc.4.4.7
+
+#view -f 0x0040 -b ${s} > ${s%.bam}_read1.bam
+
+bedtools bamtobed -i ${s} > ../Bams/Beds/${SampleName}.bed
+
+
+awk 'BEGIN {OFS = "\t"} ; {if (\$6 == "+") print \$1, \$2 + 4, \$3 + 4, \$4, \$5, \$6; else print \$1, \$2 - 5, \$3 - 5, \$4, \$5, \$6}' ../Bams/Beds/${SampleName}.bed > ../Bams/Beds/${SampleName}_shifted.bed
+EOF
+done
+
+
+# Clean the bed files
+for f1 in ../Bams/Beds/*_shifted.bed
+do
+awk '{if ($1~"chr") print $0; else print "chr"$0}' ${f1} | awk '{if ($2>0) print $0; else print $1"\t"0"\t"$3"\t"$4"\t"$5"\t"$6}' > ${f1%.bed}_chr_noNeg.bed
+done
+
+################
+##peak calling##
+################
+
+cd ../Bams/Beds/
+for s in *shifted_chr_noNeg.bed;
+
+do
+SampleName="$(echo ${s} | cut -d '_' -f1)"#here need to be updated to capture info for each read,  I worked with single end
+DIR='../../Peaks_shift/'
+out="$DIR${SampleName}"
+echo $out
+echo $s
+
+qsub -S /bin/bash -N Call_Peaks_${SampleName} -cwd -l h_vmem=20G -j y << EOF
+
+module load MACS2/2.1.0/python.2.7.8
+
+#Jason's method
+macs2 callpeak --nomodel -t ${s} -n $out --nolambda -g 3e9 --keep-dup 'all' --slocal 10000 --call-summits 
+EOF
+done
+
+#here we also output summit as they will be used later to quantify peaks
+
+######################
+##Filtering of peaks##
+######################
+
+# I need to filter the peak list using IDR (if I have replicate) 
+
+#need to create a folder ../Peaks_shift/replicates/ with the replicate inside
+
+#Now to perform the IDR analysis 
+
+for f1 in Peaks_shift/*firstPeak_chr.narrowPeak
+do
+SampleName="$(echo ${f1} | cut -d '/' -f2 | cut -d '_' -f1)"
+echo $SampleName
+qsub -S /bin/bash -N idr_${SampleName} -cwd -l h_vmem=20G -j y << EOF
+module load idr/2.0.2/python.3.4.1-atlas-3.11.30 
+python3 -c "import idr"
+python3 -c "import matplotlib"
+idr --samples ${f1} Peaks_shift/replicates/${SampleName}_replicate.narrowPeak -input-file-type narrowPeak --output-file IDR_${SampleName} --output-file-type narrowPeak --plot 
+EOF
+done
+
+
+# remove mitochondrial homologous regions 
+# create a black list for peaks likely to not be specific 
+
+# pwd  = /home/greally-lab/indexes/hg19/bwa
+
+module load samtools 
+#samtools faidx hg19.fa chrM > chrM.fa
+
+samtools faidx /gs/gsfs0/users/svc_wasp/wasp/metadata/Mmu/mm10/mm10/bwa_02_22_2018/mm10.fa chrM  > chrM.fa #select chrM from the .fa file
+
+
+# remove chrM from hg19 fasta file
+#cat hg19.fa | awk '{if (substr($0,1) == ">chrM") censor=1; else if (substr($0,1,1) == ">") censor=0; if (censor==0) print $0}' > hg19_nochrM.fa
+cat /gs/gsfs0/users/svc_wasp/wasp/metadata/Mmu/mm10/mm10/bwa_02_22_2018/mm10.fa | awk '{if (substr($0,1) == ">chrM") censor=1; else if (substr($0,1,1) == ">") censor=0; if (censor==0) print $0}' > mm10_nochrM.fa
+
+# Building bwa index for hg19 minus chrM
+#qsub -S /bin/bash -N Build_ref_nochrM -R y -cwd -l h_vmem=30G -j y << EOF
+#module load bwa 
+#bwa index -a bwtsw hg19_nochrM.fa
+#EOF
+
+qsub -S /bin/bash -N Build_ref_nochrM -R y -cwd -l h_vmem=30G -j y << EOF
+module load bwa 
+bwa index -a bwtsw mm10_nochrM.fa
+EOF
+
+#downloaded wgsim from https://github.com/lh3/wgsim/
+#load module gcc
+#downloaded wgsim from https://github.com/lh3/kseq.h/
+
+#~/ATACseq_Fabien/wgsim -d 400 -e 0 -N 10000000 -1 100 -2 100 -R 0 -r 0 chrM.fa chrM.read1.fq chrM.read2.fq
+
+~/ATACseq_Fabien/wgsim -d 400 -e 0 -N 1000000 -1 100 -R 0 -r 0 chrM.fa chrM.read1.fq 
+
+#-d size of the fragment
+#-e is error tate
+#-N is number of read to be generated
+#-1 -2 length of read 1 and 2 
+#-R  rate of mutations
+#-r fraction of indel
+
+module load picard-tools/1.92/java.1.8.0_20 
+qsub -S /bin/bash -N chrM_align -j y -R y -cwd -pe smp 10 -l h_vmem=5.6G << EOF
+module load bwa/0.7.13/gcc.4.4.7
+#bwa mem -M -t 10 hg19_nochrM.fa chrM.read1.fq chrM.read2.fq > chrM.sam
+bwa mem -M -t 10 mm10_nochrM.fa chrM.read1.fq > chrM.sam
+
+#Call peak for mitochondrial reads
+
+module load picard-tools/1.92/java.1.8.0_20 
+module load MACS2/2.1.0/python.2.7.8
+module load bedtools2
+module load samtools/0.1.19/gcc.4.4.7
+
+## Select only uniquely mapped reads and sort
+samtools view -h -S -bq 1 -F 4 chrM.sam | samtools sort -@ 15 - chrM_UMap
+echo "chrM_UMap.bam" >> chrM_flagstat.txt
+samtools flagstat chrM_UMap.bam >> chrM_flagstat.txt
+samtools index chrM_UMap.bam
+	
+## Remove duplicates
+java -jar $(which MarkDuplicates.jar) INPUT=chrM_UMap.bam OUTPUT=chrM_UMap_mkdup.bam METRICS_FILE=chrM_UMap_noMT_mkdup_metrics.txt REMOVE_DUPLICATES=true VALIDATION_STRINGENCY=SILENT CREATE_INDEX=false PROGRAM_RECORD_ID=MarkDuplicates PROGRAM_GROUP_NAME=MarkDuplicates ASSUME_SORTED=true MAX_SEQUENCES_FOR_DISK_READ_ENDS_MAP=50000
+echo "chrM_UMap_mkdup.bam" >> chrM_flagstat.txt
+samtools flagstat chrM_UMap_mkdup.bam >> chrM_flagstat.txt
+samtools index chrM_UMap_mkdup.bam
+
+# also remove duplicates with samtools rmdup
+samtools rmdup chrM_UMap_mkdup.bam chrM_UMap_mkdup_rmdup.bam
+echo "chrM_UMap_mkdup_rmdup.bam" >> chrM_flagstat.txt
+samtools flagstat chrM_UMap_mkdup_rmdup.bam >> chrM_flagstat.txt
+samtools index chrM_UMap_mkdup_rmdup.bam
+
+#samtools view -h -f 0x0040 -b chrM_UMap_mkdup_rmdup.bam > chrM_UMap_mkdup_rmdup_read1.bam
+bedtools bamtobed -i chrM_UMap_mkdup_rmdup.bam > chrM_UMap_mkdup_rmdup.bed
+awk 'BEGIN {OFS = "\t"} ; {if ($6 == "+") print $1, $2 + 4, $3 + 4, $4, $5, $6; else print $1, $2 - 5, $3 - 5, $4, $5, $6}' chrM_UMap_mkdup_rmdup.bed > chrM_UMap_mkdup_rmdup_shifted.bed
+
+#Jason's method
+macs2 callpeak --nomodel -t chrM_UMap_mkdup_rmdup_shifted.bed -n chrM --nolambda -g 3e9 --keep-dup 'all'  
+EOF
+
+wc -l chrM_peaks.narrowPeak
+# 28 peaks
+# make narrowPeak into a bed file for bedtools intersecting
+awk '{print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6}' chrM_peaks.narrowPeak > Mito_peak_blacklist.bed
+
+# Filter the mitochondrial homologous peak regions from the IDR and individual peak lists.
+
+bedtools intersect -a 1-50K_summits_chr_250.bed -b Mito_peak_blacklist.bed -v > 1-50K_summits_chr_250_blacklist.bed
+#62271
+bedtools intersect -a 2-combined-10K-gel_summits_chr_250.bed -b Mito_peak_blacklist.bed -v > 2-combined-10K-gel_summits_chr_250_blacklist.bed
+#69666
+bedtools intersect -a 3-10K-nogel_summits_chr_250.bed -b Mito_peak_blacklist.bed -v > 3-10K-nogel_summits_chr_250_blacklist.bed
+#65132
+
+bedtools intersect -a 1-50K_peaks_firstPeak_chr.narrowPeak -b Mito_peak_blacklist.bed -v > 1-50K_peaks_firstPeak_chr.narrowPeak_blacklist.bedi
+#53495
+bedtools intersect -a 2-combined-10K-gel_peaks_firstPeak_chr.narrowPeak -b Mito_peak_blacklist.bed -v > 2-combined-10K-gel_peaks_firstPeak_chr.narrowPeak_blacklist.bed
+#59597
+bedtools intersect -a 3-10K-nogel_peaks_firstPeak_chr.narrowPeak -b Mito_peak_blacklist.bed -v > 3-10K-nogel_peaks_firstPeak_chr.narrowPeak_blacklist.bed
+#55640
+bedtools intersect -a 1-50K_summits_chr_250_blacklist.bed -b 2-combined-10K-gel_summits_chr_250_blacklist.bed 3-10K-nogel_summits_chr_250_blacklist.bed -wa > list_summit_overlap.bed
+
+bedtools sort -i list_summit_overlap.bed | uniq > list_summit_overlap_sorted.bed
+#57875
+
+#########################
+##Peaks Quantification ##
+#########################
+
+#I need to create a reference with the peak that overlap between the conditions
+
+for f1 in ~/ATACseq_Fabien/Bams/Beds/*_shifted_chr_noNeg.bed 
+do
+SampleName="$(echo ${f1} | cut -d '/' -f9 | cut -d '_' -f1)"
+echo $SampleName
+qsub -S /bin/bash -N Quant_summit_${SampleName} -cwd -l h_vmem=10G -j y << EOF
+module load bedtools2
+bedtools intersect -a ${f1} -b list_summit_overlap_sorted.bed  -wo | awk '{print \$10}' | cut -d '/' -f4 | sort -n | uniq -c > ${SampleName}_readPeaks
+EOF
+done
+
+# I need to do CQN normalization
+# I need to collect the GC content and the length of each gene. 
+
+module load bedtools2
+
+bedtools nuc -fi /gs/gsfs0/users/svc_wasp/wasp/metadata/Mmu/mm10/mm10/bwa_02_22_2018/mm10.fa -bed list_summit_overlap_sorted.bed > list_summit_overlap_sorted_GCContent.txt
+
+awk '{print $4"\t"$7"\t"$14}' list_summit_overlap_sorted_GCContent.txt > list_summit_overlap_sorted_GC_Content_DF.txt
+
+
+#these files are later use in R to normalized the quantification using the cqn package. 
+
+
+
+#####################
+###QC - sequencing###
+#####################
+
+#PBC score
+
+#PBC = N1/Nd
+
+#(where N1= number of genomic locations to which EXACTLY one unique mapping read maps, and Nd = the number of genomic locations to which AT LEAST one unique mapping read maps, i.e. the number of non-redundant, unique mapping reads).
+
+for f1 in *_UMap_noMT.bam
+do
+SampleName="$(echo ${f1} | cut -d '_' -f1)"
+echo $SampleName
+
+qsub -S /bin/bash -N PBC_qc$SampleName -j y -cwd -l h_vmem=20G <<EOF
+touch PBC_QC.txt
+module load bedtools2
+bedtools bamtobed -i ${f1} | \
+awk 'BEGIN{OFS="\t"}{print \$1,\$2,\$3,\$6}' | \
+sort | uniq -c |\
+awk 'BEGIN{mt=0;m0=0;m1=0;m2=0} (\$1==1){m1=m1+1} (\$1==2){m2=m2+1} {m0=m0+1} {mt=mt+\$1} END{m1_m2=-1.0; if(m2>0) m1_m2=m1/m2; printf "%d\t%d\t%d\t%d\t%f\t%f\t%f\n",mt,m0,m1,m2,m0/mt,m1/m0,m1_m2}' >> PBC_QC.txt
+EOF
+
+done
+sort test.bed | uniq -c | less
+
+vi tst.awk
+###
+BEGIN { FS=OFS="\t" }
+{
+   for (rowNr=1;rowNr<=NF;rowNr++) {
+       cell[rowNr,NR] = $rowNr
+   }
+   maxRows = (NF > maxRows ? NF : maxRows)
+   maxCols = NR
+}
+END {
+   for (rowNr=1;rowNr<=maxRows;rowNr++) {
+       for (colNr=1;colNr<=maxCols;colNr++) {
+           printf "%s%s", cell[rowNr,colNr], (colNr < maxCols ? OFS : ORS)
+       }
+   }
+}
+
+###
+
+awk -f tst.awk PBC_QC.txt | paste temp.txt - > ENCODE_qc.txt
+
+####
+
+Library complexity is measured using the Non-Redundant Fraction (NRF) and PCR Bottlenecking Coefficients 1 and 2, or PBC1 and PBC2. Preferred values are as follows: NRF>0.9, PBC1>0.9, and PBC2>10.
+
+####
+
+##############
+##QC - Peaks##
+##############
+
+
+
+## Get the FRiP recommended FRIP >0.3
+
+# peaks are written out for each peak
+#count the fraction of read within each peak
+
+for f1 in *_peaks.narrowPeak;
+do
+awk '!array[$2,$3]++' $f1 > ${f1%.narrowPeak}_firstPeak.narrowPeak
+done
+
+# Clean narrowPeak files
+for f1 in *_firstPeak.narrowPeak;
+do
+awk '{if ($1~"chr") print $0; else print "chr"$0}' ${f1} > ${f1%.narrowPeak}_chr.narrowPeak
+done
+
+
+#get the Frip
+
+touch FriP.txt
+#module load bedtools2
+for f1 in *firstPeak_chr.narrowPeak
+do
+SampleName="$(echo ${f1} | cut -d '_' -f1)"
+echo $SampleName >> FriP.txt
+echo $f1
+bedtools intersect -a ../Bams/Beds/${SampleName}_shifted_chr_noNeg.bed -b ${f1} -u | wc -l >> FriP.txt
+echo ${SampleName}_total >> FriP.txt
+ wc -l ../Bams/Beds/${SampleName}_shifted_chr_noNeg.bed | awk '{print $1}'>> FriP.txt
+ echo ${SampleName}_ratio >> FriP.txt
+ x=$(bedtools intersect -a ../Bams/Beds/${SampleName}_shifted_chr_noNeg.bed -b ${f1} -u | wc -l)
+ y=$(wc -l ../Bams/Beds/${SampleName}_shifted_chr_noNeg.bed | awk '{print $1}')
+ awk "BEGIN {print $x/$y}">> FriP.txt
+ done
+
+##################
+## Get the FRiS ##
+##################
+
+#same as FriP but for summit
+# clean up the summit files 
+
+for f1 in *_summits.bed;
+do
+awk '{if ($1~"chr") print $0; else print "chr"$0}' ${f1} > ${f1%.bed}_chr.bed
+done
+
+# need to +/- 250 bp to each summit to create a window surrounding each summit
+for f1 in *_summits_chr.bed;
+do
+awk '{if ($2-250 > 0) print $1"\t"$2-250"\t"$3+250"\t"$4"\t"$5; else print $1"\t0\t"$3+250"\t"$4"\t"$5}' $f1 >${f1%.bed}_250.bed
+done 
+
+touch FRiS.txt
+#module load bedtools2
+for f1 in *_summits_chr_250.bed
+do
+SampleName="$(echo ${f1} | cut -d '_' -f1)"
+echo $SampleName >> FRiS.txt
+echo $f1
+bedtools intersect -a ../Bams/Beds/${SampleName}_shifted_chr_noNeg.bed -b ${f1} -u | wc -l >> FRiS.txt
+echo ${SampleName}_total >> FRiS.txt
+ wc -l ../Bams/Beds/${SampleName}_shifted_chr_noNeg.bed | awk '{print $1}' >> FRiS.txt
+ echo ${SampleName}_ratio >> FRiS.txt
+ x=$(bedtools intersect -a ../Bams/Beds/${SampleName}_shifted_chr_noNeg.bed -b ${f1} -u | wc -l)
+ y=$(wc -l ../Bams/Beds/${SampleName}_shifted_chr_noNeg.bed | awk '{print $1}')
+ awk "BEGIN {print $x/$y}">> FRiS.txt
+ done
+
+
+
+###############################################################################################################IN R ############################################
+################################################################################
+
+
+options(stringsAsFactors=F)
+
+###CQN normalization###
+
+#package "cqn"
+source("https://bioconductor.org/biocLite.R")
+biocLite("cqn")
+library(cqn)
+
+peak=read.table("*_readPeaks")
+
+GC_DF=read.table("/Volumes/home/svc_wasp/ATACseq_Fabien/Peaks_shift/list_summit_overlap_sorted_GC_Content_DF.txt",header=T)
+
+GC_DF=data.frame(do.call(rbind,strsplit(GC_DF[,1],"/"))[,4],GC_DF[,-1])
+
+peak_cqn=merge(peak,GC_DF,by=1)
+
+
+norm_peak=cqn(peak_cqn[,2],peak_cqn[,3],peak_cqn[,4],lengthMethod="fixed") #column with the peak quatnif and the 2 score from GC_DF file
+
+peak_norm=data.frame(peak_cqn,(norm_peak$y+norm_peak$offset))#generate normalized quantif
+
+colnames(peak_norm)=c("Peak_ID","Peak_score","Peak_score_norm")
+
+write.table(peak_norm,"",sep="\t",col.names=T,row.names=F,quote=F)
+
+
+###enrichment TSS### 
+
+#you want TSS to be enriched for reads
+
+#ATAC seq recommendations############################
+#					Concerning	Acceptable	Ideal	#
+# hg19 Refseq TSS		<6			6-10		>10	#
+# GRCh38 Refseq TSS		<5			5-7			>7	#
+# mm9 GENCODE TSS		<5			5-7			>7	#
+# mm10 Refseq TSS		<10			10-15		>15	#
+#####################################################			
+
+#R - TSS_enrich.R# Rscript to be called in bash later
+
+dataFile <- commandArgs()[6]
+name <- commandArgs()[7]
+library(data.table)
+TSSwin <- fread(dataFile)
+wcount <- data.frame(table(TSSwin[,4])) #list the window and number of reads per window
+norm_fact <- mean(wcount[c(1,20),2])
+wcount_norm <- wcount[,2]/norm_fact #normalize by total number of reads within 2kb window
+TSS_enrich <- mean(wcount_norm[c(10,11)])
+print(paste(name, "'s TSS enrichment is ", TSS_enrich, sep=""))
+
+
+
+###in bash##
+
+#creating a GTF file with only protein coding and make a bed with 1kb on either side of TSS 
+
+# generate protein coding only gtf
+
+# I need to install cgat
+
+curl -O https://raw.githubusercontent.com/CGATOxford/cgat/master/install-CGAT-tools.sh
+bash ./install-CGAT-tools.sh --production --location ~/ATACseq_Fabien/Bams/Beds/
+
+source /gs/gsfs0/users/svc_wasp/ATACseq_Fabien/Bams/Beds/conda-install/bin/activate cgat-s
+
+#I wget gencode.vM17.annotation.gtf from Encode
+
+cgat gtf2gtf --method=filter --filter-method=proteincoding -I gencode.vM17.annotation.gtf > gencode.vM17.annotation.prot.gtf 
+
+#generate bed file with +/- 1kb from TSS
+
+awk '$3=="gene" {print $1,$4-1,$5,$10,$16,$7; OFS="\t"}' gencode.vM17.annotation.prot.gtf  | tr -d '";' > gencode.vM17.annotation.prot.TSSgene.bed
+awk -F "\t" 'OFS="\t" {if ($6=="+") {print $1,$2-1000,$2+1000,$4,$5,$6} if ($6=="-") {print $1,$3-1000,$3+1000,$4,$5,$6}}' gencode.vM17.annotation.prot.TSSgene.bed > gencode.vM17.annotation.prot.TSSgene1kb.bed
+
+#make 100bp windows to calculate enrichement 
+
+module load bedtools2
+bedtools makewindows -b gencode.vM17.annotation.prot.TSSgene1kb.bed -w 100 -i winnum > gencode.vM17.annotation.prot.TSSgene1kb.100bpwins.bed
+
+
+# script in bash
+
+for f1 in *_shifted_chr_noNeg.bed
+do
+SAMPLE="$(echo ${f1} | cut -d '_' -f1)"
+echo $SAMPLE
+module load bedtools2/2.26.0/gcc.4.4.7
+bedtools intersect -a gencode.vM17.annotation.prot.TSSgene1kb.100bpwins.bed -b $f1 -wo > ${f1%.bed}_TSSwin.txt
+
+Rscript TSS_enrich.R ${f1%.bed}_TSSwin.txt $SAMPLE_TSSenrichement
+
+done
+
+#enrichment outcome#
+
+#$SAMPLE
+#Read 1251433 rows and 11 (of 11) columns from 0.121 GB file in 00:00:05
+#[1] "SAMPLE TSS enrichment is 10.0381130642361"
